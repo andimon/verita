@@ -316,6 +316,61 @@ jobs:
           git commit -m "chore: bump version to ${{ needs.version.outputs.next_version }} [skip ci]"
           git push origin ${{ github.ref_name }}
 
+
+  # Update README with current or next version
+  update-readme:
+    runs-on: ubuntu-22.04
+    needs: [version, build-and-test]
+    if: needs.build-and-test.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update README version
+        run: |
+          # Determine which version to use
+          if [ "${{ needs.version.outputs.should_release }}" = "true" ]; then
+            VERSION_TO_USE="${{ needs.version.outputs.next_version }}"
+            echo "Updating README with release version: ${VERSION_TO_USE}"
+          else
+            VERSION_TO_USE="${{ needs.version.outputs.current_version }}"
+            echo "Updating README with current version: ${VERSION_TO_USE}"
+          fi
+          
+          # Update the version in README.md
+          # This regex finds and replaces the version in the dependency example
+          sed -i "s/{:verita, \"~> [^\"]*\"}/{:verita, \"~> ${VERSION_TO_USE}\"}/g" README.md
+          
+          # Verify the change was made
+          if grep -q "{:verita, \"~> ${VERSION_TO_USE}\"}" README.md; then
+            echo "README.md successfully updated with version ${VERSION_TO_USE}"
+          else
+            echo "Warning: README.md may not have been updated correctly"
+          fi
+
+      - name: Commit README changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Check if README was actually modified
+          if ! git diff --quiet README.md; then
+            git add README.md
+            if [ "${{ needs.version.outputs.should_release }}" = "true" ]; then
+              git commit -m "docs: update README version to ${{ needs.version.outputs.next_version }} [skip ci]"
+            else
+              git commit -m "docs: update README version to ${{ needs.version.outputs.current_version }} [skip ci]"
+            fi
+            git push origin ${{ github.ref_name }}
+            echo "README.md committed and pushed"
+          else
+            echo "No changes to README.md, skipping commit"
+          fi
+
   # Create/overwrite Git tags for releases
   tag:
     runs-on: ubuntu-22.04
