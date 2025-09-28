@@ -5,8 +5,6 @@ on:
     branches:
       - 'feature/**'
       - 'hotfix/**'
-      - master
-      - develop
   pull_request:
     branches:
       - master
@@ -242,8 +240,7 @@ jobs:
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v4
         with:
-          file: ./cover/excoveralls.json,
-          token: ${{ secrets.CODECOV_TOKEN }},
+          file: ./cover/excoveralls.json
           fail_ci_if_error: false
 
       - name: Generate documentation
@@ -271,10 +268,56 @@ jobs:
           name: documentation
           path: doc/
 
+  # Update version in mix.exs
+  update-version:
+    runs-on: ubuntu-22.04
+    needs: [version]
+    if: needs.version.outputs.should_release == 'true' && needs.version.outputs.current_version != needs.version.outputs.next_version
+    permissions:
+      contents: write
+    outputs:
+      version_updated: ${{ steps.update.outputs.updated }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update version in mix.exs
+        id: update
+        run: |
+          CURRENT_VERSION="${{ needs.version.outputs.current_version }}"
+          NEW_VERSION="${{ needs.version.outputs.next_version }}"
+          
+          echo "Updating version from ${CURRENT_VERSION} to ${NEW_VERSION}"
+          
+          # Update version in mix.exs
+          sed -i "s/version: \"${CURRENT_VERSION}\"/version: \"${NEW_VERSION}\"/" mix.exs
+          
+          # Verify the update
+          UPDATED_VERSION=$(grep -o 'version: "[^"]*"' mix.exs | cut -d'"' -f2)
+          if [ "$UPDATED_VERSION" != "$NEW_VERSION" ]; then
+            echo "Version update failed. Expected: $NEW_VERSION, Got: $UPDATED_VERSION"
+            exit 1
+          fi
+          
+          echo "updated=true" >> $GITHUB_OUTPUT
+
+      - name: Commit version update
+        if: steps.update.outputs.updated == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add mix.exs
+          git commit -m "chore: bump version to ${{ needs.version.outputs.next_version }} [skip ci]"
+          git push origin ${{ github.ref_name }}
+
   # Create/overwrite Git tags for releases
   tag:
     runs-on: ubuntu-22.04
-    needs: [version, build-and-test]
+    needs: [version, build-and-test, update-version]
     if: github.event_name == 'push' && needs.build-and-test.result == 'success' && needs.version.outputs.should_release == 'true'
     permissions:
       contents: write
@@ -319,7 +362,7 @@ jobs:
   # Publish to Hex.pm (only stable releases)
   publish:
     runs-on: ubuntu-22.04
-    needs: [version, build-and-test, tag]
+    needs: [version, build-and-test, tag, update-version]
     if: needs.version.outputs.should_release == 'true' && needs.version.outputs.is_prerelease == 'false' && (github.ref == 'refs/heads/master') && vars.PUBLISH_TO_HEX == 'true'
     permissions:
       contents: write
@@ -438,10 +481,7 @@ jobs:
               [
                 "@semantic-release/release-notes-generator",
                 {
-                  "preset": "conventionalcommits",
-                  "presetConfig": {
-                     "initialVersion": "0.0.0"
-                  }
+                  "preset": "conventionalcommits"
                 }
               ],
               [
