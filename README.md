@@ -8,7 +8,7 @@ Add `verita` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:verita, "~> 0.0.1"}
+    {:verita, "~> 0.1.0"}
   ]
 end
 ```
