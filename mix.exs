@@ -1,13 +1,12 @@
 defmodule Verita.MixProject do
   use Mix.Project
 
-  @version "0.0.1"
   @github "https://github.com/andimon/verita"
   def project do
     [
       app: :verita,
-      version: @version,
-      elixir: "~> 1.18",
+      version: "0.0.1",
+      elixir: "~> 1.15",
       description: description(),
       start_permanent: Mix.env() == :prod,
       package: package(),
