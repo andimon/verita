@@ -1,0 +1,532 @@
+name: Build, Test, and Release Elixir Package
+
+on:
+  push:
+    branches:
+      - 'feature/**'
+      - 'hotfix/**'
+  pull_request:
+    branches:
+      - master
+      - develop
+
+# Workflow level environment variables
+env:
+  MIX_ENV: test
+  ELIXIR_VERSION: "1.15"
+  OTP_VERSION: "26.2.5"
+
+jobs:
+  # Determine next version
+  version:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
+      checks: read
+      pull-requests: read
+    # Outputs that can be shared with other jobs
+    outputs:
+      current_version: ${{ steps.current.outputs.version }}
+      next_version: ${{ steps.semantic.outputs.version }}
+      should_release: ${{ steps.semantic.outputs.should_release }}
+      is_prerelease: ${{ steps.semantic.outputs.is_prerelease }}
+      tag: ${{ steps.semantic.outputs.tag }}
+    steps:
+      # Download repository code to make it available for next steps
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # obtain full commit history
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get current version from mix.exs
+        id: current
+        run: |
+          CURRENT_VERSION=$(grep -o 'version: "[^"]*"' mix.exs | cut -d'"' -f2)
+          echo "version=${CURRENT_VERSION}" >> $GITHUB_OUTPUT
+          echo "Current version in mix.exs: ${CURRENT_VERSION}"
+
+      - name: Setup Node.js for semantic-release
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install semantic-release
+        run: |
+          npm install -g semantic-release@21.1.2 @semantic-release/changelog@6.0.3 @semantic-release/git@10.0.1 @semantic-release/github@9.2.1 conventional-changelog-conventionalcommits@6.1.0
+
+      - name: Configure semantic-release (dry-run mode)
+        run: |
+          cat > .releaserc.json << 'EOF'
+          {
+            "branches": [
+              "master",
+              {
+                "name": "develop",
+                "prerelease": "beta"
+              }
+            ],
+            "plugins": [
+              [
+                "@semantic-release/commit-analyzer",
+                {
+                  "preset": "conventionalcommits",
+                  "releaseRules": [
+                    {"type": "feat", "release": "minor"},
+                    {"type": "fix", "release": "patch"},
+                    {"type": "perf", "release": "patch"},
+                    {"type": "revert", "release": "patch"},
+                    {"type": "docs", "release": false},
+                    {"type": "style", "release": false},
+                    {"type": "chore", "release": false},
+                    {"type": "refactor", "release": "patch"},
+                    {"type": "test", "release": false},
+                    {"type": "build", "release": "patch"},
+                    {"type": "ci", "release": false},
+                    {"breaking": true, "release": "major"}
+                  ]
+                }
+              ],
+              [
+                "@semantic-release/release-notes-generator",
+                {
+                  "preset": "conventionalcommits"
+                }
+              ]
+            ]
+          }
+          EOF
+
+      - name: Get next version
+        id: semantic
+        run: |
+          set -x
+          
+          if [ "${{ github.ref }}" = "refs/heads/master" ]; then
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "should_release=true" >> $GITHUB_OUTPUT
+              echo "is_prerelease=false" >> $GITHUB_OUTPUT
+              
+              # Run semantic-release in dry-run mode to get next version
+              SEMANTIC_OUTPUT=$(semantic-release --dry-run 2>&1) || true
+              NEXT_VERSION=$(echo "$SEMANTIC_OUTPUT" | grep -oP 'The next release version is \K[^\s]+' || echo "")
+              
+              if [ -n "$NEXT_VERSION" ]; then
+                echo "version=${NEXT_VERSION}" >> $GITHUB_OUTPUT
+                echo "tag=v${NEXT_VERSION}" >> $GITHUB_OUTPUT
+              else
+                echo "No release needed - keeping current version"
+                echo "version=${{ steps.current.outputs.version }}" >> $GITHUB_OUTPUT
+                echo "tag=v${{ steps.current.outputs.version }}" >> $GITHUB_OUTPUT
+                echo "should_release=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "should_release=false" >> $GITHUB_OUTPUT
+              echo "version=${{ steps.current.outputs.version }}" >> $GITHUB_OUTPUT
+              echo "tag=v${{ steps.current.outputs.version }}" >> $GITHUB_OUTPUT
+            fi
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "should_release=true" >> $GITHUB_OUTPUT
+              echo "is_prerelease=true" >> $GITHUB_OUTPUT
+              
+              CURRENT_VERSION="${{ steps.current.outputs.version }}"
+              # Simple beta version - no commit hash, no build numbers
+              NEXT_VERSION="${CURRENT_VERSION}-beta"
+              
+              echo "version=${NEXT_VERSION}" >> $GITHUB_OUTPUT
+              echo "tag=v${NEXT_VERSION}" >> $GITHUB_OUTPUT
+            else
+              echo "should_release=false" >> $GITHUB_OUTPUT
+              echo "version=${{ steps.current.outputs.version }}" >> $GITHUB_OUTPUT
+              echo "tag=v${{ steps.current.outputs.version }}" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "version=${{ steps.current.outputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag=v${{ steps.current.outputs.version }}" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Security scanning
+  security:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Build, test, and analyze Elixir package
+  build-and-test:
+    runs-on: ubuntu-22.04
+    needs: [version, security]
+    if: always() && (needs.security.result == 'success' || needs.security.result == 'skipped')
+    strategy:
+      matrix:
+        elixir: ['1.15']
+        otp: ['26.2.5']
+        
+    env:
+      MIX_ENV: test
+
+    outputs:
+      coverage-report: ${{ steps.test.outputs.coverage }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+          version-type: strict
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
+            ${{ runner.os }}-mix-
+
+      - name: Install dependencies
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Compile with warnings as errors
+        run: mix compile --warnings-as-errors
+
+      - name: Run Credo static analysis
+        run: mix credo --strict
+
+      - name: Run Dialyzer type checking
+        run: mix dialyzer
+
+      - name: Run tests with coverage
+        id: test
+        run: |
+          mix coveralls.json
+          COVERAGE=$(cat cover/excoveralls.json | jq -r '.total_coverage')
+          echo "coverage=${COVERAGE}" >> $GITHUB_OUTPUT
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./cover/excoveralls.json,
+          token: ${{ secrets.CODECOV_TOKEN }},
+          fail_ci_if_error: false
+
+      - name: Generate documentation
+        run: |
+          mix deps.get
+          mix docs
+        env:
+          MIX_ENV: dev
+
+      - name: Build Hex package
+        if: matrix.elixir == '1.15' && matrix.otp == '26.2.5'
+        run: mix hex.build
+
+      - name: Upload package artifact
+        if: matrix.elixir == '1.15' && matrix.otp == '26.2.5'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hex-package
+          path: "*.tar"
+
+      - name: Upload documentation artifact
+        if: matrix.elixir == '1.15' && matrix.otp == '26.2.5'
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: doc/
+
+  # Create/overwrite Git tags for releases
+  tag:
+    runs-on: ubuntu-22.04
+    needs: [version, build-and-test]
+    if: github.event_name == 'push' && needs.build-and-test.result == 'success' && needs.version.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create/overwrite Git tag
+        run: |
+          TAG_NAME="${{ needs.version.outputs.tag }}"
+          VERSION="${{ needs.version.outputs.next_version }}"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # For beta releases, we want to overwrite the existing tag
+          if [[ "$VERSION" == *"-beta" ]]; then
+            echo "Creating/overwriting beta tag: $TAG_NAME"
+            # Delete existing tag if it exists (both local and remote)
+            git tag -d "$TAG_NAME" 2>/dev/null || true
+            git push origin ":refs/tags/$TAG_NAME" 2>/dev/null || true
+            
+            # Create new tag
+            git tag -a "$TAG_NAME" -m "Beta release $VERSION"
+            git push origin "$TAG_NAME"
+            echo "Beta tag created/overwritten: $TAG_NAME"
+          else
+            # For stable releases, only create if tag doesn't exist
+            if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+              echo "Tag $TAG_NAME already exists, skipping tag creation"
+              exit 0
+            fi
+            
+            git tag -a "$TAG_NAME" -m "Release $VERSION"
+            git push origin "$TAG_NAME"
+            echo "Stable release tag created: $TAG_NAME"
+          fi
+
+  # Publish to Hex.pm (only stable releases)
+  publish:
+    runs-on: ubuntu-22.04
+    needs: [version, build-and-test, tag]
+    if: needs.version.outputs.should_release == 'true' && needs.version.outputs.is_prerelease == 'false' && (github.ref == 'refs/heads/master') && vars.PUBLISH_TO_HEX == 'true'
+    permissions:
+      contents: write
+    environment: 
+      name: hex-production
+      url: https://hex.pm/packages/${{ github.event.repository.name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Pull latest changes
+        run: git pull origin ${{ github.ref_name }}
+
+      - name: Setup Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Cache dependencies for publish
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-publish-${{ hashFiles('**/mix.lock') }}
+
+      - name: Install dependencies for publishing
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          MIX_ENV=dev mix deps.get
+        env:
+          MIX_ENV: dev
+
+      - name: Publish to Hex.pm
+        run: |
+          echo "Publishing version ${{ needs.version.outputs.next_version }} to Hex.pm"
+          echo "⚠️  You have 60 minutes to revert with: mix hex.publish --revert ${{ needs.version.outputs.next_version }}"
+          MIX_ENV=dev mix hex.publish --yes
+        env:
+          MIX_ENV: dev
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+  # Deploy documentation to GitHub Pages (only stable releases)
+  deploy-docs:
+    runs-on: ubuntu-22.04
+    needs: [version, build-and-test]
+    if: needs.version.outputs.is_prerelease == 'false' && (github.ref == 'refs/heads/master')
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download documentation artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: documentation
+          path: doc/
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: doc/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # Create GitHub release with changelog (only stable releases)
+  release:
+    runs-on: ubuntu-22.04
+    needs: [version, build-and-test, tag, publish, deploy-docs]
+    if: needs.version.outputs.should_release == 'true' && needs.version.outputs.is_prerelease == 'false' && (github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull latest changes
+        run: git pull origin ${{ github.ref_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install semantic-release
+        run: |
+          npm install -g semantic-release@21.1.2 @semantic-release/changelog@6.0.3 @semantic-release/git@10.0.1 @semantic-release/github@9.2.1 conventional-changelog-conventionalcommits@6.1.0
+
+      - name: Configure semantic-release for actual release
+        run: |
+          cat > .releaserc.json << 'EOF'
+          {
+            "branches": ["master"],
+            "plugins": [
+              [
+                "@semantic-release/commit-analyzer",
+                {
+                  "preset": "conventionalcommits"
+                }
+              ],
+              [
+                "@semantic-release/release-notes-generator",
+                {
+                  "preset": "conventionalcommits"
+                }
+              ],
+              [
+                "@semantic-release/changelog",
+                {
+                  "changelogFile": "CHANGELOG.md"
+                }
+              ],
+              [
+                "@semantic-release/git",
+                {
+                  "assets": ["CHANGELOG.md"],
+                  "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+                }
+              ],
+              [
+                "@semantic-release/github",
+                {
+                  "assets": [
+                    {
+                      "path": "*.tar",
+                      "name": "hex-package-${nextRelease.version}.tar",
+                      "label": "Hex Package"
+                    }
+                  ]
+                }
+              ]
+            ]
+          }
+          EOF
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: hex-package
+
+      - name: Create release and update changelog
+        run: semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Workflow summary
+  notify:
+    runs-on: ubuntu-22.04
+    needs: [version, build-and-test, tag, publish, deploy-docs, release]
+    if: always()
+    steps:
+      - name: Workflow summary
+        run: |
+          echo "## 📦 Elixir Package Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ needs.version.outputs.next_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Git Tag:** ${{ needs.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Event:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Should Release:** ${{ needs.version.outputs.should_release }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Is Prerelease:** ${{ needs.version.outputs.is_prerelease }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.build-and-test.result }}" = "success" ]; then
+            echo "✅ **Build & Test:** Success" >> $GITHUB_STEP_SUMMARY
+            echo "**Coverage:** ${{ needs.build-and-test.outputs.coverage-report }}%" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Build & Test:** Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.version.outputs.is_prerelease }}" = "true" ]; then
+            echo "🧪 **Beta Release:** Created/Overwritten" >> $GITHUB_STEP_SUMMARY
+            echo "**Beta Version:** ${{ needs.version.outputs.next_version }}" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.deploy-docs.result }}" = "success" ]; then
+            echo "📚 **Documentation:** Deployed to GitHub Pages" >> $GITHUB_STEP_SUMMARY
+            echo "**URL:** https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.publish.result }}" = "success" ]; then
+            echo "🚀 **Hex.pm Publication:** Success" >> $GITHUB_STEP_SUMMARY
+            echo "**Package:** https://hex.pm/packages/${{ github.event.repository.name }}" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.version.outputs.should_release }}" = "true" ] && [ "${{ needs.version.outputs.is_prerelease }}" = "false" ]; then
+            echo "⚠️ **Hex.pm Publication:** Failed or skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ **Hex.pm Publication:** Only for stable releases" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.release.result }}" = "success" ]; then
+            echo "🎉 **GitHub Release:** Created successfully" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.version.outputs.should_release }}" = "true" ] && [ "${{ needs.version.outputs.is_prerelease }}" = "false" ]; then
+            echo "⚠️ **GitHub Release:** Failed or skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ **GitHub Release:** Only for stable releases" >> $GITHUB_STEP_SUMMARY
+          fi
