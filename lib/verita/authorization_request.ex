@@ -238,5 +238,4 @@ defmodule Verita.AuthorizationRequest do
 
   defp format_error(:invalid_state),
     do: "invalid state: must be a string"
-
 end
