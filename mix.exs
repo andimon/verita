@@ -5,7 +5,7 @@ defmodule Verita.MixProject do
   def project do
     [
       app: :verita,
-      version: "0.1.0-beta",
+      version: "0.1.0-beta-beta",
       elixir: "~> 1.15",
       description: description(),
       start_permanent: Mix.env() == :prod,
