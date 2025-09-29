@@ -15,6 +15,7 @@ defmodule Verita.AuthorizationRequest do
   5. `state` - RECOMMENDED. An opaque value used by the client to maintain state
      between the request and callback. Should be used for preventing CSRF attacks
      as described in [Section 10.12](https://datatracker.ietf.org/doc/html/rfc6749#section-10.12)
+
   """
 
   @enforce_keys [:response_type, :client_id]
@@ -238,5 +239,4 @@ defmodule Verita.AuthorizationRequest do
   defp format_error(:invalid_state),
     do: "invalid state: must be a string"
 
-  defp format_error(reason), do: "invalid authorization request: #{inspect(reason)}"
 end
